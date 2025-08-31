@@ -1,0 +1,24 @@
+name: CamStreamer
+options:
+  minimumXcodeGenVersion: 2.38.0
+  deploymentTarget:
+    iOS: "15.0"
+targets:
+  CamStreamer:
+    type: application
+    platform: iOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: App
+    settings:
+      PRODUCT_BUNDLE_IDENTIFIER: com.example.CamStreamer
+      PRODUCT_NAME: CamStreamer
+      INFOPLIST_FILE: App/Info.plist
+      SWIFT_VERSION: 5.0
+      CODE_SIGN_STYLE: Manual
+      TARGETED_DEVICE_FAMILY: 1
+      VALID_ARCHS: arm64
+      IPHONEOS_DEPLOYMENT_TARGET: "15.0"
+    scheme:
+      testTargets: []
+    postCompileScripts: []
