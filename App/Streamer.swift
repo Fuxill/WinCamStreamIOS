@@ -5,8 +5,20 @@ import Network
 import CoreMedia
 import SwiftUI
 
+// Callback C pour VideoToolbox (VTCompressionOutputCallback)
+private func vtOutputCallback(_ outputCallbackRefCon: UnsafeMutableRawPointer?,
+                              _ sourceFrameRefCon: UnsafeMutableRawPointer?,
+                              _ status: OSStatus,
+                              _ infoFlags: VTEncodeInfoFlags,
+                              _ sampleBuffer: CMSampleBuffer?) {
+    guard status == noErr, let sbuf = sampleBuffer else { return }
+    guard let refCon = outputCallbackRefCon else { return }
+    let streamer = Unmanaged<Streamer>.fromOpaque(refCon).takeUnretainedValue()
+    streamer.handleEncodedSampleBuffer(sbuf)
+}
+
 @main
-struct CamStreamerApp: App {
+struct WinCamStreamIOSApp: App {
     @StateObject private var streamer = Streamer()
     var body: some Scene {
         WindowGroup {
@@ -27,30 +39,32 @@ struct CamStreamerApp: App {
 
 final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     @Published var status = "Init…"
+
     private let session = AVCaptureSession()
     private var device: AVCaptureDevice?
     private var videoOutput = AVCaptureVideoDataOutput()
+
     private var vtSession: VTCompressionSession?
     private var listener: NWListener?
     private var connection: NWConnection?
 
-    // encoder params
+    // Réglages encodeur / capture
     private let targetWidth = 1920
     private let targetHeight = 1080
-    private let targetFPS: Double = 120 // tentera 120, fallback 60 si indisponible
-    private let intraOnly = true        // true = GOP 1 (latence minimale, débit plus élevé)
-    private let bitrate = 60_000_000    // 60 Mb/s (ajustez si besoin)
+    private let targetFPS: Double = 120         // tentative 120, fallback 60 si indispo
+    private let intraOnly = true                // GOP=1 (latence mini, débit plus élevé)
+    private let bitrate = 60_000_000            // ~60 Mb/s (ajuste si besoin)
 
     func start() {
-        Task { @MainActor in
+        DispatchQueue.main.async {
             self.status = "Démarrage…"
-            self.setupTCP()
-            self.setupCapture()
-            self.setupEncoder(width: targetWidth, height: targetHeight)
         }
+        setupTCP()
+        setupCapture()
+        setupEncoder(width: targetWidth, height: targetHeight)
     }
 
-    // MARK: USB over TCP (server on device)
+    // MARK: - Réseau USB (server TCP sur l’iPhone)
     private func setupTCP() {
         do {
             let params = NWParameters.tcp
@@ -76,7 +90,7 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         }
     }
 
-    // MARK: Camera
+    // MARK: - Camera
     private func setupCapture() {
         session.beginConfiguration()
         session.sessionPreset = .inputPriority
@@ -96,7 +110,7 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
             return
         }
 
-        // Choix du format 1080p avec fps le plus élevé (vise 120)
+        // 1080p @ 120 si dispo, sinon 60
         if !selectFormat(device: cam, width: targetWidth, height: targetHeight, fps: targetFPS) {
             _ = selectFormat(device: cam, width: targetWidth, height: targetHeight, fps: 60.0)
         }
@@ -110,7 +124,7 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         session.addOutput(videoOutput)
 
         if let conn = videoOutput.connection(with: .video) {
-            conn.videoOrientation = .portrait // ou .landscapeRight selon votre usage
+            conn.videoOrientation = .portrait // changer si paysage souhaité
         }
 
         session.commitConfiguration()
@@ -124,11 +138,8 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
             let desc = f.formatDescription
             let dims = CMVideoFormatDescriptionGetDimensions(desc)
             guard dims.width == width && dims.height == height else { continue }
-            // Cherche le plus gros framerate dispo
-            for r in f.videoSupportedFrameRateRanges {
-                if r.maxFrameRate >= fps {
-                    best = f; break
-                }
+            for r in f.videoSupportedFrameRateRanges where r.maxFrameRate >= fps {
+                best = f; break
             }
         }
         guard let chosen = best else { return false }
@@ -149,36 +160,44 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         }
     }
 
-    // MARK: Encoder
+    // MARK: - Encodeur VideoToolbox
     private func setupEncoder(width: Int, height: Int) {
-        let status = VTCompressionSessionCreate(allocator: nil,
-                                                width: Int32(width),
-                                                height: Int32(height),
-                                                codecType: kCMVideoCodecType_H264,
-                                                encoderSpecification: nil,
-                                                imageBufferAttributes: nil,
-                                                compressedDataAllocator: nil,
-                                                outputCallback: nil,
-                                                refcon: nil,
-                                                compressionSessionOut: &vtSession)
-        guard status == noErr, let vt = vtSession else {
-            self.status = "VTCompressionSessionCreate failed \(status)"; return
+        // refcon = pointeur non retenu vers self, récupéré dans vtOutputCallback
+        let refcon = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+        let statusCreate = VTCompressionSessionCreate(allocator: nil,
+                                                      width: Int32(width),
+                                                      height: Int32(height),
+                                                      codecType: kCMVideoCodecType_H264,
+                                                      encoderSpecification: nil,
+                                                      imageBufferAttributes: nil,
+                                                      compressedDataAllocator: nil,
+                                                      outputCallback: vtOutputCallback,
+                                                      refcon: refcon,
+                                                      compressionSessionOut: &vtSession)
+        guard statusCreate == noErr, let vt = vtSession else {
+            self.status = "VTCompressionSessionCreate failed \(statusCreate)"
+            return
         }
-        VTSessionSetProperty(vt, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue)
-        VTSessionSetProperty(vt, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse)
-        // Baseline profile (latence minimale)
-        VTSessionSetProperty(vt, kVTCompressionPropertyKey_ProfileLevel,
-                             kVTProfileLevel_H264_Baseline_AutoLevel)
 
-        // GOP (intra-only si souhaité)
+        // Propriétés avec labels key:/value:
+        VTSessionSetProperty(vt, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+        VTSessionSetProperty(vt, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
+        VTSessionSetProperty(vt, key: kVTCompressionPropertyKey_ProfileLevel,
+                             value: kVTProfileLevel_H264_Baseline_AutoLevel)
+
+        // GOP (=1 si intraOnly)
         let gop: Int32 = intraOnly ? 1 : 30
-        VTSessionSetProperty(vt, kVTCompressionPropertyKey_MaxKeyFrameInterval, gop as CFTypeRef)
-        VTSessionSetProperty(vt, kVTCompressionPropertyKey_ExpectedFrameRate, Int32(targetFPS) as CFTypeRef)
+        VTSessionSetProperty(vt, key: kVTCompressionPropertyKey_MaxKeyFrameInterval,
+                             value: NSNumber(value: gop))
+        VTSessionSetProperty(vt, key: kVTCompressionPropertyKey_ExpectedFrameRate,
+                             value: NSNumber(value: Int32(targetFPS)))
 
-        // Débit
-        VTSessionSetProperty(vt, kVTCompressionPropertyKey_AverageBitRate, bitrate as CFTypeRef)
-        let dataRateLimits: [Int] = [bitrate/8, 1]  // bytes/sec, second
-        VTSessionSetProperty(vt, kVTCompressionPropertyKey_DataRateLimits, dataRateLimits as CFArray)
+        // Débit + limites
+        VTSessionSetProperty(vt, key: kVTCompressionPropertyKey_AverageBitRate,
+                             value: NSNumber(value: bitrate))
+        let dataRateLimits: [NSNumber] = [NSNumber(value: bitrate/8), NSNumber(value: 1)]
+        VTSessionSetProperty(vt, key: kVTCompressionPropertyKey_DataRateLimits,
+                             value: dataRateLimits as CFArray)
 
         VTCompressionSessionPrepareToEncodeFrames(vt)
         statusUpdate("Encoder prêt (bitrate \(bitrate/1_000_000) Mb/s, GOP \(gop))")
@@ -186,61 +205,60 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
 
     private func statusUpdate(_ s: String) { DispatchQueue.main.async { self.status = s } }
 
-    // MARK: Capture → Encode → Send
+    // MARK: - Capture → Encode
     func captureOutput(_ output: AVCaptureOutput,
                        didOutput sampleBuffer: CMSampleBuffer,
-                       from connection: AVCaptureConnection)
-    {
+                       from connection: AVCaptureConnection) {
         guard let vt = vtSession,
               let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         var flagsOut: VTEncodeInfoFlags = []
-        let status = VTCompressionSessionEncodeFrame(vt, imageBuffer: imageBuffer,
-                                                     presentationTimeStamp: pts,
-                                                     duration: .invalid,
-                                                     frameProperties: nil,
-                                                     sourceFrameRefcon: nil,
-                                                     infoFlagsOut: &flagsOut,
-                                                     outputHandler: { [weak self] status, _, sbuf, _, _, _ in
-            guard status == noErr, let sbuf = sbuf else { return }
-            self?.handleEncodedSampleBuffer(sbuf)
-        })
-        if status != noErr {
-            statusUpdate("Encode err \(status)")
+        let st = VTCompressionSessionEncodeFrame(vt,
+                                                 imageBuffer: imageBuffer,
+                                                 presentationTimeStamp: pts,
+                                                 duration: .invalid,
+                                                 frameProperties: nil,
+                                                 sourceFrameRefcon: nil,
+                                                 infoFlagsOut: &flagsOut)
+        if st != noErr {
+            statusUpdate("Encode err \(st)")
         }
     }
 
-    private func handleEncodedSampleBuffer(_ sbuf: CMSampleBuffer) {
-        guard let conn = connection else { return } // attend un client
+    // MARK: - Envoi des NALs (Annex B) sur le socket
+    fileprivate func handleEncodedSampleBuffer(_ sbuf: CMSampleBuffer) {
+        guard let conn = connection else { return }
         guard let dataBuffer = CMSampleBufferGetDataBuffer(sbuf) else { return }
 
-        // Récup SPS/PPS si frame clé
-        let isKey = (CMSampleBufferGetSampleAttachmentsArray(sbuf, createIfNecessary: false) as? [[CFString: Any]])?
-            .first?[kCMSampleAttachmentKey_NotSync] as? Bool == false
+        // Frame clé ?
+        let attachments = CMSampleBufferGetSampleAttachmentsArray(sbuf, createIfNecessary: false) as? [[CFString: Any]]
+        let isKey = (attachments?.first?[kCMSampleAttachmentKey_NotSync] as? Bool) == false
 
         var out = Data()
-        if isKey, let fmt = CMSampleBufferGetFormatDescription(sbuf) {
-            if let spspps = annexBParameterSets(from: fmt) {
-                out.append(spspps) // startcode + SPS, startcode + PPS
-            }
+
+        if isKey, let fmt = CMSampleBufferGetFormatDescription(sbuf),
+           let spspps = annexBParameterSets(from: fmt) {
+            out.append(spspps) // startcode+SPS, startcode+PPS
         }
-        // Convertit AVCC → Annex B (remplace la longueur NAL par 0x00000001)
+
         if let nals = annexBFromSampleBuffer(dataBuffer: dataBuffer) {
             out.append(nals)
         }
+
         if !out.isEmpty {
-            conn.send(content: out, completion: .contentProcessed({ _ in }))
+            conn.send(content: out, completion: .contentProcessed { _ in })
         }
     }
 
-    // MARK: Annex B helpers
+    // SPS/PPS → Annex B
     private func annexBParameterSets(from fmt: CMFormatDescription) -> Data? {
         var spsPtr: UnsafePointer<UInt8>?
         var ppsPtr: UnsafePointer<UInt8>?
         var spsLen = 0, ppsLen = 0
         var count: Int = 0
         var nalLenField: Int32 = 0
+
         let s1 = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmt, parameterSetIndex: 0,
                                                                     parameterSetPointerOut: &spsPtr,
                                                                     parameterSetSizeOut: &spsLen,
@@ -254,28 +272,4 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         guard s1 == noErr, s2 == noErr, let sps = spsPtr, let pps = ppsPtr else { return nil }
         let sc: [UInt8] = [0,0,0,1]
         var d = Data(sc); d.append(sps, count: spsLen)
-        d.append(contentsOf: sc); d.append(pps, count: ppsLen)
-        return d
-    }
-
-    private func annexBFromSampleBuffer(dataBuffer: CMBlockBuffer) -> Data? {
-        var totalLen: Int = 0
-        var dataPtr: UnsafeMutablePointer<Int8>?
-        guard CMBlockBufferGetDataPointer(dataBuffer, atOffset: 0, lengthAtOffsetOut: &totalLen,
-                                          totalLengthOut: &totalLen, dataPointerOut: &dataPtr) == noErr,
-              let base = dataPtr else { return nil }
-        var out = Data(capacity: totalLen + 64)
-        var offset = 0
-        // NALU format AVCC: [len][NAL][len][NAL]...
-        while offset + 4 <= totalLen {
-            let len = base.advanced(by: offset).withMemoryRebound(to: UInt32.self, capacity: 1) { ptr in
-                CFSwapInt32BigToHost(ptr.pointee)
-            }
-            let sc: [UInt8] = [0,0,0,1]
-            out.append(contentsOf: sc)
-            out.append(Data(bytes: base.advanced(by: offset + 4), count: Int(len)))
-            offset += 4 + Int(len)
-        }
-        return out
-    }
-}
+        d.append(contentsOf:
