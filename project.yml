@@ -11,14 +11,10 @@ targets:
     sources:
       - path: App
     settings:
-      PRODUCT_BUNDLE_IDENTIFIER: com.dashperf.WinCamStreamIOS
+      PRODUCT_BUNDLE_IDENTIFIER: com.dashperf.wincamstreamios
       PRODUCT_NAME: WinCamStreamIOS
       INFOPLIST_FILE: App/Info.plist
       SWIFT_VERSION: 5.0
       CODE_SIGN_STYLE: Manual
       TARGETED_DEVICE_FAMILY: 1
-      VALID_ARCHS: arm64
       IPHONEOS_DEPLOYMENT_TARGET: "15.0"
-    scheme:
-      testTargets: []
-    postCompileScripts: []
