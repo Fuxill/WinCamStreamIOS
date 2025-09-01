@@ -11,8 +11,8 @@ targets:
     sources:
       - path: App
     settings:
-      PRODUCT_BUNDLE_IDENTIFIER: com.example.CamStreamer
-      PRODUCT_NAME: CamStreamer
+      PRODUCT_BUNDLE_IDENTIFIER: com.dashperf.WinCamStreamIOS
+      PRODUCT_NAME: WinCamStreamIOS
       INFOPLIST_FILE: App/Info.plist
       SWIFT_VERSION: 5.0
       CODE_SIGN_STYLE: Manual
