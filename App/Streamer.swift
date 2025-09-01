@@ -56,6 +56,10 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
     private let intraOnly = true               // GOP = 1 (latence mini, débit ↑)
     private let bitrate   = 60_000_000         // ~60 Mb/s (ajustez si besoin)
 
+    // Correctifs flux / keyframe
+    private var sentCodecHeader = false        // a-t-on déjà envoyé SPS/PPS ?
+    private var forceIDRNext    = false        // forcer IDR sur la prochaine frame encodée
+
     // MARK: - Lifecycle
     func start() {
         status = "Démarrage…"
@@ -74,10 +78,16 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
                 DispatchQueue.main.async { self?.status = "Listener: \(st)" }
             }
             lst.newConnectionHandler = { [weak self] conn in
-                self?.connection?.cancel()
-                self?.connection = conn
+                guard let self else { return }
+                self.connection?.cancel()
+                self.connection = conn
+
+                // À chaque nouvelle connexion : ré-envoyer SPS/PPS et forcer une keyframe
+                self.sentCodecHeader = false
+                self.forceIDRNext = true
+
                 conn.stateUpdateHandler = { st in
-                    DispatchQueue.main.async { self?.status = "TCP client: \(st)" }
+                    DispatchQueue.main.async { self.status = "TCP client: \(st)" }
                 }
                 conn.start(queue: .global(qos: .userInitiated))
             }
@@ -200,13 +210,22 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
                        from connection: AVCaptureConnection) {
         guard let vt = vtSession,
               let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+
+        // Force IDR sur la prochaine frame si demandé (à la première connexion, par ex.)
+        var frameProps: CFDictionary?
+        if forceIDRNext {
+            let dict: [String: Any] = [kVTEncodeFrameOptionKey_ForceKeyFrame as String: true]
+            frameProps = dict as CFDictionary
+            forceIDRNext = false
+        }
+
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         var flags: VTEncodeInfoFlags = []
         let st = VTCompressionSessionEncodeFrame(vt,
                                                  imageBuffer: imageBuffer,
                                                  presentationTimeStamp: pts,
                                                  duration: .invalid,
-                                                 frameProperties: nil,
+                                                 frameProperties: frameProps,
                                                  sourceFrameRefcon: nil,
                                                  infoFlagsOut: &flags)
         if st != noErr {
@@ -219,17 +238,18 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         guard let conn = connection,
               let dataBuffer = CMSampleBufferGetDataBuffer(sbuf) else { return }
 
-        // Keyframe ?
-        var isKey = false
-        if let att = CMSampleBufferGetSampleAttachmentsArray(sbuf, createIfNecessary: false) as? [[CFString: Any]] {
-            isKey = (att.first?[kCMSampleAttachmentKey_NotSync] as? Bool) == false
-        }
+        // Keyframe ? (si NotSync est absent -> on considère que c'est une keyframe)
+        let notSync = (CMSampleBufferGetSampleAttachmentsArray(sbuf, createIfNecessary: false)?
+                       .first?[kCMSampleAttachmentKey_NotSync] as? Bool) ?? false
+        let isKey = !notSync
 
         var payload = Data()
 
-        if isKey, let fmt = CMSampleBufferGetFormatDescription(sbuf),
+        // Toujours fournir SPS/PPS à la 1ère opportunité et à chaque keyframe
+        if let fmt = CMSampleBufferGetFormatDescription(sbuf),
            let spspps = annexBParameterSets(from: fmt) {
-            payload.append(spspps) // startcode+SPS puis startcode+PPS
+            if isKey { payload.append(spspps); sentCodecHeader = true }
+            else if !sentCodecHeader { payload.append(spspps); sentCodecHeader = true }
         }
 
         if let nals = annexBFromSampleBuffer(dataBuffer: dataBuffer) {
