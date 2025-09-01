@@ -1,10 +1,10 @@
-name: CamStreamer
+name: WinCamStreamIOS
 options:
   minimumXcodeGenVersion: 2.38.0
   deploymentTarget:
     iOS: "15.0"
 targets:
-  CamStreamer:
+  WinCamStreamIOS:
     type: application
     platform: iOS
     deploymentTarget: "15.0"
