@@ -8,24 +8,44 @@ struct WinCamStreamIOSApp: App {
     var body: some Scene {
         WindowGroup {
             ZStack {
+                // Fond plein écran (évite toute “bande” résiduelle)
                 Color(UIColor.systemBackground).ignoresSafeArea()
 
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 0) {
-                        // Fine marge top pour éviter tout rognage
-                        Color.clear.frame(height: 6)
+                // iOS 16+ : indicateurs visibles ; iOS 15 : ScrollView simple
+                Group {
+                    if #available(iOS 16.0, *) {
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 0) {
+                                // Fine marge top pour éviter le rognage du status
+                                Color.clear.frame(height: 6)
 
-                        StreamerView(streamer: streamer, pending: $pending)
-                            .padding(.horizontal)
-                            .padding(.top, 6)
-                            .padding(.bottom, 6)
+                                StreamerView(streamer: streamer, pending: $pending)
+                                    .padding(.horizontal)
+                                    .padding(.top, 6)
+                                    .padding(.bottom, 6)
 
-                        // Fine marge bas pour laisser respirer le dernier texte
-                        Color.clear.frame(height: 10)
+                                // Fine marge bas pour le texte d’astuce
+                                Color.clear.frame(height: 10)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .topLeading)
+                        }
+                        .scrollIndicators(.visible)
+                    } else {
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 0) {
+                                Color.clear.frame(height: 6)
+
+                                StreamerView(streamer: streamer, pending: $pending)
+                                    .padding(.horizontal)
+                                    .padding(.top, 6)
+                                    .padding(.bottom, 6)
+
+                                Color.clear.frame(height: 10)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .topLeading)
+                        }
                     }
-                    .frame(maxWidth: .infinity, alignment: .topLeading)
                 }
-                .scrollIndicators(.visible) // iOS 17+
             }
             .onAppear { pending = PendingConfig(from: streamer) }
         }
