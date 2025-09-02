@@ -21,6 +21,8 @@ struct StreamerView: View {
                     Text(streamer.status)
                         .font(.system(.footnote, design: .monospaced))
                         .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.8)
                     if !streamer.metrics.isEmpty {
                         Text(streamer.metrics)
                             .font(.system(.caption2, design: .monospaced))
@@ -47,8 +49,7 @@ struct StreamerView: View {
                     // Baseline => CAVLC
                     if pending.profile == .baseline { pending.entropy = .cavlc }
 
-                    streamer.setConfig(from: pending)
-                    if streamer.isRunning { streamer.restart() }
+                    streamer.applyOrRestart(with: pending) // ⬅️ live ou restart selon le diff
                 }
                 .buttonStyle(.bordered)
                 .disabled(streamer.isBusy)
@@ -151,10 +152,11 @@ struct StreamerView: View {
 
             Divider()
 
-            Text("Astuce : après Apply, lance `iproxy \(pending.port) \(pending.port)` puis `ffplay -f h264 -fflags nobuffer -flags low_delay -probesize 2048 -analyzeduration 0 -vsync drop -use_wallclock_as_timestamps 1 -i tcp://127.0.0.1:\(pending.port)`.")
+            Text("Astuce : après Apply, lance `iproxy \(pending.port) \(pending.port)` puis `ffplay -fflags nobuffer -flags low_delay -probesize 2048 -analyzeduration 0 -vsync drop -use_wallclock_as_timestamps 1 -i tcp://127.0.0.1:\(pending.port)?tcp_nodelay=1`.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
-                .padding(.top, 8)
+                .lineLimit(3)
+                .minimumScaleFactor(0.9)
         }
     }
 }
