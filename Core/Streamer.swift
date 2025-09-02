@@ -51,7 +51,7 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
 
     // MARK: Anti-dérive / sécurité
     fileprivate var sentCodecHeader = false
-    fileprivate var forceIDRNext = false
+    fileprivate var forceIDRNext = false   // <— reste privé au fichier
     private var sendingFrame = false
     private var sessionGen: UInt64 = 0
 
@@ -78,6 +78,11 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         autoRotate   = p.autoRotate
         profile      = p.profile
         entropy      = p.entropy
+    }
+
+    // MARK: - Public controls
+    func requestKeyframe() {
+        controlQ.async { [weak self] in self?.forceIDRNext = true }
     }
 
     // MARK: Lifecycle
