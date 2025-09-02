@@ -7,14 +7,27 @@ struct WinCamStreamIOSApp: App {
 
     var body: some Scene {
         WindowGroup {
-            // Vue plein écran, sans marges haut/bas
-            StreamerView(streamer: streamer, pending: $pending)
-                .padding(.horizontal)
-                .padding(.top, 12)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                .background(Color(UIColor.systemBackground))
-                .ignoresSafeArea() // <- enlève les bandes noires perçues
-                .onAppear { pending = PendingConfig(from: streamer) }
+            ZStack {
+                Color(UIColor.systemBackground).ignoresSafeArea()
+
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 0) {
+                        // Fine marge top pour éviter tout rognage
+                        Color.clear.frame(height: 6)
+
+                        StreamerView(streamer: streamer, pending: $pending)
+                            .padding(.horizontal)
+                            .padding(.top, 6)
+                            .padding(.bottom, 6)
+
+                        // Fine marge bas pour laisser respirer le dernier texte
+                        Color.clear.frame(height: 10)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                }
+                .scrollIndicators(.visible) // iOS 17+
+            }
+            .onAppear { pending = PendingConfig(from: streamer) }
         }
     }
 }
