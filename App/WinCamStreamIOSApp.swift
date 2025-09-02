@@ -7,14 +7,14 @@ struct WinCamStreamIOSApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ScrollView {
-                StreamerView(streamer: streamer, pending: $pending)
-                    .padding(.horizontal)
-                    .padding(.top, 12)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            .background(Color(UIColor.systemBackground))
-            .onAppear { pending = PendingConfig(from: streamer) }
+            // Vue plein écran, sans marges haut/bas
+            StreamerView(streamer: streamer, pending: $pending)
+                .padding(.horizontal)
+                .padding(.top, 12)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .background(Color(UIColor.systemBackground))
+                .ignoresSafeArea() // <- enlève les bandes noires perçues
+                .onAppear { pending = PendingConfig(from: streamer) }
         }
     }
 }
