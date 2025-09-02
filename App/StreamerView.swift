@@ -53,7 +53,7 @@ struct StreamerView: View {
                 .buttonStyle(.bordered)
                 .disabled(streamer.isBusy)
 
-                Button("Force keyframe") { streamer.forceIDRNext = true }
+                Button("Force keyframe") { streamer.requestKeyframe() }
                     .buttonStyle(.bordered)
                     .disabled(!streamer.isRunning || streamer.isBusy)
             }
