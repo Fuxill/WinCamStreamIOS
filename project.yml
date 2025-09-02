@@ -10,6 +10,7 @@ targets:
     deploymentTarget: "15.0"
     sources:
       - path: App
+      - path: Core
     settings:
       PRODUCT_BUNDLE_IDENTIFIER: com.dashperf.wincamstreamios
       PRODUCT_NAME: WinCamStreamIOS
