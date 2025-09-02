@@ -19,6 +19,3 @@ targets:
       CODE_SIGN_STYLE: Manual
       TARGETED_DEVICE_FAMILY: 1
       IPHONEOS_DEPLOYMENT_TARGET: "15.0"
-    info:
-      properties:
-        NSCameraUsageDescription: "Utilisation de la caméra pour le streaming vidéo via USB."
