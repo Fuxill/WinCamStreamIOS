@@ -26,7 +26,7 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
 
     // MARK: Queues
     private let controlQ = DispatchQueue(label: "Streamer.control")
-    private let sessionQ = DispatchQueue(label: "Streamer.session") // capture + encode (série)
+    private let sessionQ = DispatchQueue(label: "Streamer.session") // capture + encode
 
     // MARK: Capture
     private let session = AVCaptureSession()
@@ -40,7 +40,7 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
     private var listener: NWListener?
     private var connection: NWConnection?
 
-    // MARK: Réglages
+    // MARK: Réglages (courants)
     @Published var listenPort: UInt16 = 5000
     @Published var targetWidth: Int = 1920
     @Published var targetHeight: Int = 1080
@@ -71,6 +71,7 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
     // Auto-rotate
     private var orientationObserver: NSObjectProtocol?
     private var didBeginOrientationNotifications = false
+    private var orientationPoller: DispatchSourceTimer?
 
     // MARK: Config API
     func setConfig(from p: PendingConfig) {
@@ -87,14 +88,71 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         entropy      = p.entropy
     }
 
-    // MARK: - Public controls
+    /// Applique `pending` : live si possible, sinon restart propre.
+    func applyOrRestart(with new: PendingConfig) {
+        controlQ.async {
+            // Détecte si un rebuild est requis (change le "bitstream shape")
+            let needsRestart =
+                new.resolution.width  != self.targetWidth  ||
+                new.resolution.height != self.targetHeight ||
+                new.profile           != self.profile      ||
+                new.entropy           != self.entropy      ||
+                new.outputProtocol    != self.outputProtocol ||
+                new.port              != self.listenPort
+
+            self.setConfig(from: new)
+
+            guard self.isRunning else {
+                // pas démarré : rien d’autre à faire
+                return
+            }
+
+            if needsRestart {
+                self.restart()
+            } else {
+                self.applyLiveTweaks()
+            }
+        }
+    }
+
+    /// Modifs à chaud (bitrate, fps, GOP, orientation)
+    private func applyLiveTweaks() {
+        sessionQ.async {
+            if let vt = self.vtSession {
+                VTSessionSetProperty(vt, key: kVTCompressionPropertyKey_AverageBitRate,
+                                     value: NSNumber(value: self.bitrate))
+                let limits: [NSNumber] = [NSNumber(value: self.bitrate/8), NSNumber(value: 1)]
+                VTSessionSetProperty(vt, key: kVTCompressionPropertyKey_DataRateLimits,
+                                     value: limits as CFArray)
+                VTSessionSetProperty(vt, key: kVTCompressionPropertyKey_ExpectedFrameRate,
+                                     value: NSNumber(value: Int32(self.targetFPS)))
+                let gop: Int32 = self.intraOnly ? 1 : 30
+                VTSessionSetProperty(vt, key: kVTCompressionPropertyKey_MaxKeyFrameInterval,
+                                     value: NSNumber(value: gop))
+            }
+            if let dev = self.device {
+                do {
+                    try dev.lockForConfiguration()
+                    let ts = CMTime(value: 1, timescale: CMTimeScale(self.targetFPS))
+                    dev.activeVideoMinFrameDuration = ts
+                    dev.activeVideoMaxFrameDuration = ts
+                    dev.unlockForConfiguration()
+                } catch { /* ignore */ }
+            }
+            if let conn = self.videoOutput.connection(with: .video) {
+                conn.videoOrientation = self.orientation
+            }
+            self.forceIDRNext = true // re-sync côté lecteur
+            DispatchQueue.main.async { self.status = "Live updated (bitrate/fps/GOP/orientation)" }
+        }
+    }
+
+    // MARK: Lifecycle
     func requestKeyframe() {
         controlQ.async { [weak self] in self?.forceIDRNext = true }
     }
 
-    // MARK: Lifecycle
     func start() {
-        // Empêche les doubles clics / races
         guard state == .idle else { return }
         DispatchQueue.main.async { self.isBusy = true; self.status = "Checking camera…" }
 
@@ -123,11 +181,9 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
 
                 self.setupTCP(on: self.listenPort)
 
-                // Capture + encoder sur la queue session (série)
                 self.sessionQ.async {
                     self.setupCapture()
                     self.setupEncoder(width: self.targetWidth, height: self.targetHeight)
-
                     self.startStats()
                     DispatchQueue.main.async {
                         self.installOrientationObserverIfNeeded()
@@ -147,11 +203,9 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
             self.state = .stopping
             DispatchQueue.main.async { self.isBusy = true }
 
-            // Arrêt capture + encode sur la queue session
             self.sessionQ.sync {
                 self.videoOutput.setSampleBufferDelegate(nil, queue: nil)
                 self.session.stopRunning()
-
                 if let vt = self.vtSession {
                     self.vtSession = nil
                     VTCompressionSessionCompleteFrames(vt, untilPresentationTimeStamp: .invalid)
@@ -163,18 +217,11 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
             self.listener?.cancel(); self.listener = nil
 
             DispatchQueue.main.async {
-                if self.didBeginOrientationNotifications {
-                    UIDevice.current.endGeneratingDeviceOrientationNotifications()
-                    self.didBeginOrientationNotifications = false
-                }
-                if let obs = self.orientationObserver {
-                    NotificationCenter.default.removeObserver(obs)
-                    self.orientationObserver = nil
-                }
                 UIApplication.shared.isIdleTimerDisabled = false
             }
 
             self.stopStats()
+            self.removeOrientationObserver()
 
             self.state = .idle
             DispatchQueue.main.async {
@@ -204,14 +251,12 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
     private func ensureCameraAuthorized(_ completion: @escaping (Bool) -> Void) {
         let st = AVCaptureDevice.authorizationStatus(for: .video)
         switch st {
-        case .authorized:
-            completion(true)
+        case .authorized: completion(true)
         case .notDetermined:
             AVCaptureDevice.requestAccess(for: .video) { granted in
                 DispatchQueue.main.async { completion(granted) }
             }
-        default:
-            completion(false)
+        default: completion(false)
         }
     }
 
@@ -316,7 +361,7 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
             device.activeVideoMinFrameDuration = ts
             device.activeVideoMaxFrameDuration = ts
             device.unlockForConfiguration()
-            DispatchQueue.main.async { self.status = "Format fixé: \(width)x\(height) @\(Int(fps))" }
+            DispatchQueue.main.async { self.status = "Format fixé: \(width)x\(Int(height)) @\(Int(fps))" }
             return true
         } catch {
             DispatchQueue.main.async { self.status = "Format err: \(error.localizedDescription)" }
@@ -383,10 +428,12 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
 
     private func statusUpdate(_ s: String) { DispatchQueue.main.async { self.status = s } }
 
-    // MARK: Capture → Encode
+    // MARK: Capture → Encode (back-pressure : on skippe si envoi en cours)
     func captureOutput(_ output: AVCaptureOutput,
                        didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
+        if sendingFrame { return } // ⚠️ évite de remplir la file quand réseau plafonne
+
         guard let vt = vtSession,
               let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
@@ -416,7 +463,7 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         guard let conn = connection,
               let dataBuffer = CMSampleBufferGetDataBuffer(sbuf) else { return }
 
-        if sendingFrame { return } // anti-backlog
+        if sendingFrame { return }
         sendingFrame = true
         let currentGen = sessionGen
 
@@ -433,13 +480,13 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
             switch outputProtocol {
             case .annexb:
                 if let spspps = H264Packer.annexBParameterSets(from: fmt) {
-                    if isKey { payload.append(spspps); sentCodecHeader = true }
+                    if isKey { payload.append(spspps) }      // toujours SPS/PPS sur IDR
                     else if !sentCodecHeader { payload.append(spspps); sentCodecHeader = true }
                 }
                 if let nals = H264Packer.annexBFromSampleBuffer(dataBuffer: dataBuffer) { payload.append(nals) }
             case .avcc:
                 if let spspps = H264Packer.avccParameterSets(from: fmt) {
-                    if isKey { payload.append(spspps); sentCodecHeader = true }
+                    if isKey { payload.append(spspps) }
                     else if !sentCodecHeader { payload.append(spspps); sentCodecHeader = true }
                 }
                 if let raw = H264Packer.rawFromSampleBuffer(dataBuffer: dataBuffer) { payload.append(raw) }
@@ -479,7 +526,7 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         framesWindow = 0; bytesWindow = 0
     }
 
-    // MARK: Auto-rotate
+    // MARK: Auto-rotate (notif + poller, marche même avec verrou d’orientation)
     private func installOrientationObserverIfNeeded() {
         removeOrientationObserver()
         guard autoRotate else { return }
@@ -494,8 +541,22 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
             ) { [weak self] _ in
                 self?.applyDeviceOrientation()
             }
+            self.startOrientationPoller() // fallback si la notif n'arrive pas
             self.applyDeviceOrientation()
         }
+    }
+
+    private func startOrientationPoller() {
+        stopOrientationPoller()
+        let t = DispatchSource.makeTimerSource(queue: .main)
+        t.schedule(deadline: .now() + 0.5, repeating: 0.5)
+        t.setEventHandler { [weak self] in self?.applyDeviceOrientation() }
+        t.resume()
+        orientationPoller = t
+    }
+
+    private func stopOrientationPoller() {
+        orientationPoller?.cancel(); orientationPoller = nil
     }
 
     private func removeOrientationObserver() {
@@ -504,6 +565,7 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
                 NotificationCenter.default.removeObserver(obs)
                 self.orientationObserver = nil
             }
+            self.stopOrientationPoller()
             if self.didBeginOrientationNotifications {
                 UIDevice.current.endGeneratingDeviceOrientationNotifications()
                 self.didBeginOrientationNotifications = false
@@ -512,14 +574,15 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
     }
 
     private func applyDeviceOrientation() {
-        guard let conn = videoOutput.connection(with: .video) else { return }
+        guard autoRotate, let conn = videoOutput.connection(with: .video) else { return }
         let devOri = UIDevice.current.orientation
         let newOri: AVCaptureVideoOrientation
         switch devOri {
         case .landscapeLeft:      newOri = .landscapeRight
         case .landscapeRight:     newOri = .landscapeLeft
         case .portraitUpsideDown: newOri = .portrait
-        default:                  newOri = .portrait
+        case .portrait:           newOri = .portrait
+        default:                  newOri = conn.videoOrientation // ne change rien si « unknown »
         }
         if conn.videoOrientation != newOri { conn.videoOrientation = newOri }
     }
