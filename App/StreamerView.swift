@@ -49,7 +49,7 @@ struct StreamerView: View {
                     // Baseline => CAVLC
                     if pending.profile == .baseline { pending.entropy = .cavlc }
 
-                    streamer.applyOrRestart(with: pending) // ⬅️ live ou restart selon le diff
+                    streamer.applyOrRestart(with: pending) // live or restart selon le diff
                 }
                 .buttonStyle(.bordered)
                 .disabled(streamer.isBusy)
@@ -152,7 +152,36 @@ struct StreamerView: View {
 
             Divider()
 
-            Text("Astuce : après Apply, lance `iproxy \(pending.port) \(pending.port)` puis `ffplay -fflags nobuffer -flags low_delay -probesize 2048 -analyzeduration 0 -vsync drop -use_wallclock_as_timestamps 1 -i tcp://127.0.0.1:\(pending.port)?tcp_nodelay=1`.")
+            // Performance (NOUVEAU)
+            Group {
+                Text("Performance").font(.headline)
+
+                // Toggle Adaptation auto (bitrate/fps)
+                Toggle("Adaptation auto (bitrate/fps)", isOn: Binding(
+                    get: { streamer.adaptationEnabled },
+                    set: { streamer.setAdaptation(enabled: $0) }
+                ))
+
+                // Frames en vol (1 ↔ 2)
+                HStack {
+                    Text("Frames en vol")
+                    Spacer()
+                    Stepper(value: Binding(
+                        get: { streamer.maxInFlight },
+                        set: { streamer.setMaxInFlight($0) }
+                    ), in: 1...2) {
+                        Text("\(streamer.maxInFlight)")
+                            .frame(minWidth: 24, alignment: .trailing)
+                    }
+                }
+                Text("1 = latence minimale (drops possibles). 2 = un peu plus lisse (+latence).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Divider()
+
+            Text("Astuce : après Apply, lance `iproxy \(pending.port) \(pending.port)` puis `ffplay -fflags nobuffer -flags low_delay -probesize 2048 -analyzeduration 0 -framedrop -use_wallclock_as_timestamps 1 -i tcp://127.0.0.1:\(pending.port)?tcp_nodelay=1`.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
                 .lineLimit(3)
