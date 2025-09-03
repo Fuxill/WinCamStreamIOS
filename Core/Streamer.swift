@@ -289,9 +289,9 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
                 conn.stateUpdateHandler = { st in
                     DispatchQueue.main.async { self.status = "TCP client: \(st)" }
                 }
-                conn.start(queue: .global(qos: .userInitiited))
+                conn.start(queue: controlQ)
             }
-            lst.start(queue: .global(qos: .userInitiated))
+            lst.start(queue: controlQ)
             self.listener = lst
         } catch {
             DispatchQueue.main.async { self.status = "TCP error: \(error.localizedDescription)" }
