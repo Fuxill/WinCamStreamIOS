@@ -10,6 +10,20 @@ targets:
     deploymentTarget: "15.0"
     sources:
       - path: App
+        includes:
+          - "**/*.swift"
+          - "LaunchScreen.storyboard"
+      - path: Core
+    info:
+      path: App/Info.plist
+      properties:
+        UILaunchStoryboardName: LaunchScreen
+        NSCameraUsageDescription: "Nous avons besoin de la caméra pour le streaming vidéo."
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeRight
+          - UIInterfaceOrientationLandscapeLeft
+        UIRequiresFullScreen: true
     settings:
       PRODUCT_BUNDLE_IDENTIFIER: com.dashperf.wincamstreamios
       PRODUCT_NAME: WinCamStreamIOS
