@@ -25,9 +25,28 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
     @Published var isBusy: Bool = false
     @Published var metrics: String = ""
 
+    // Exposés à l’UI
+    @Published var listenPort: UInt16 = 5000
+    @Published var targetWidth: Int = 1920
+    @Published var targetHeight: Int = 1080
+    @Published var targetFPS: Double = 60
+    @Published var intraOnly: Bool = false
+    @Published var bitrate: Int = 35_000_000
+    @Published var outputProtocol: OutputProtocol = .annexb
+    @Published var orientation: AVCaptureVideoOrientation = .portrait
+    @Published var autoRotate: Bool = true
+    @Published var profile: H264Profile = .high
+    @Published var entropy: H264Entropy = .cabac
+
+    // NOUVEAU : (dés)activer l’adaptation auto
+    @Published var adaptationEnabled: Bool = true
+
+    // NOUVEAU : frames “en vol” réglables (1 ↔ 2 généralement)
+    @Published private(set) var maxInFlight: Int = 2
+
     // MARK: - Queues
-    private let controlQ = DispatchQueue(label: "Streamer.control")  // état réseau, adaptation
-    private let sessionQ = DispatchQueue(label: "Streamer.session")  // capture + encode
+    private let controlQ = DispatchQueue(label: "Streamer.control", qos: .userInitiated)  // état réseau, adaptation, slots
+    private let sessionQ = DispatchQueue(label: "Streamer.session", qos: .userInteractive) // capture + encode
 
     // MARK: - Capture
     private let session = AVCaptureSession()
@@ -41,27 +60,13 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
     private var listener: NWListener?
     private var connection: NWConnection?
 
-    // MARK: - Réglages courants (modifiables)
-    @Published var listenPort: UInt16 = 5000
-    @Published var targetWidth: Int = 1920
-    @Published var targetHeight: Int = 1080
-    @Published var targetFPS: Double = 60
-    @Published var intraOnly: Bool = false                // GOP>1 par défaut pour qualité
-    @Published var bitrate: Int = 35_000_000              // ~35 Mb/s
-    @Published var outputProtocol: OutputProtocol = .annexb
-    @Published var orientation: AVCaptureVideoOrientation = .portrait
-    @Published var autoRotate: Bool = true
-    @Published var profile: H264Profile = .high
-    @Published var entropy: H264Entropy = .cabac
-
     // MARK: - Sync & sécurité
     fileprivate var sentCodecHeader = false
     fileprivate var forceIDRNext = false
     private var sessionGen: UInt64 = 0
 
-    // Envoi réseau : petite file (2 frames max)
+    // File d’envoi
     private var inFlight: Int = 0
-    private let maxInFlight: Int = 2
 
     // Stats
     private var statsTimer: DispatchSourceTimer?
@@ -71,6 +76,10 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
     // Adaptation
     private var dropCountWindow: Int = 0
     private var adaptTimer: DispatchSourceTimer?
+
+    // Cache des headers pour “hot-restart”
+    private var lastSpsPpsAnnexB: Data?
+    private var lastAvccConfig: Data?
 
     // Auto-rotate (CoreMotion + fallback notifications)
     private let motion = CMMotionManager()
@@ -82,7 +91,7 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
     private enum State { case idle, starting, running, stopping }
     private var state: State = .idle
 
-    // MARK: - Public API (UI)
+    // MARK: - Helpers d’API pour l’UI
     func setConfig(from p: PendingConfig) {
         listenPort   = p.port
         targetWidth  = p.resolution.width
@@ -97,7 +106,6 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         entropy      = p.entropy
     }
 
-    /// Applique `new`: live si possible, sinon restart propre.
     func applyOrRestart(with new: PendingConfig) {
         controlQ.async {
             let needsRestart =
@@ -111,15 +119,29 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
             self.setConfig(from: new)
 
             guard self.isRunning else { return }
-
             if needsRestart { self.restart() }
             else { self.applyLiveTweaks() }
         }
     }
 
-    func requestKeyframe() {
-        controlQ.async { [weak self] in self?.forceIDRNext = true }
+    // NOUVEAU : Activer/Désactiver adaptation auto
+    func setAdaptation(enabled: Bool) {
+        controlQ.async {
+            self.adaptationEnabled = enabled
+            if enabled { self.startAdaptation() } else { self.stopAdaptation() }
+        }
     }
+
+    // NOUVEAU : Régler frames en vol (1..4, recommandation 1 ou 2)
+    func setMaxInFlight(_ v: Int) {
+        controlQ.async {
+            let nv = max(1, min(4, v))
+            self.maxInFlight = nv
+            if self.inFlight > nv { self.inFlight = nv }
+        }
+    }
+
+    func requestKeyframe() { controlQ.async { [weak self] in self?.forceIDRNext = true } }
 
     func start() {
         guard state == .idle else { return }
@@ -145,9 +167,7 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
                 self.inFlight = 0
                 self.dropCountWindow = 0
 
-                DispatchQueue.main.async {
-                    UIApplication.shared.isIdleTimerDisabled = true
-                }
+                DispatchQueue.main.async { UIApplication.shared.isIdleTimerDisabled = true }
 
                 self.setupTCP(on: self.listenPort)
 
@@ -155,7 +175,7 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
                     self.setupCapture()
                     self.setupEncoder(width: self.targetWidth, height: self.targetHeight)
                     self.startStats()
-                    self.startAdaptation()
+                    if self.adaptationEnabled { self.startAdaptation() } else { self.stopAdaptation() }
                     DispatchQueue.main.async {
                         self.installOrientationObserverIfNeeded()
                         self.state = .running
@@ -187,9 +207,7 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
             self.connection?.cancel(); self.connection = nil
             self.listener?.cancel(); self.listener = nil
 
-            DispatchQueue.main.async {
-                UIApplication.shared.isIdleTimerDisabled = false
-            }
+            DispatchQueue.main.async { UIApplication.shared.isIdleTimerDisabled = false }
 
             self.stopStats()
             self.stopAdaptation()
@@ -210,7 +228,7 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
             switch self.state {
             case .running:
                 self.stop()
-                self.controlQ.asyncAfter(deadline: .now() + 0.3) { self.start() }
+                self.controlQ.asyncAfter(deadline: .now() + 0.5) { self.start() }
             case .idle:
                 self.start()
             default:
@@ -246,15 +264,17 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
             if let conn = self.videoOutput.connection(with: .video) {
                 conn.videoOrientation = self.orientation
             }
+            // S’assure que le décodage repart clean après modifs
+            self.sentCodecHeader = false
             self.forceIDRNext = true
+
             DispatchQueue.main.async { self.status = "Live updated (bitrate/fps/GOP/orientation)" }
         }
     }
 
     // MARK: - Permissions
     private func ensureCameraAuthorized(_ completion: @escaping (Bool) -> Void) {
-        let st = AVCaptureDevice.authorizationStatus(for: .video)
-        switch st {
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized: completion(true)
         case .notDetermined:
             AVCaptureDevice.requestAccess(for: .video) { granted in
@@ -284,12 +304,35 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
             }
             lst.newConnectionHandler = { [weak self] conn in
                 guard let self = self else { return }
+                // Remplace l’ancienne connexion
                 self.connection?.cancel()
                 self.connection = conn
                 self.sentCodecHeader = false
                 self.forceIDRNext = true
-                conn.stateUpdateHandler = { st in
+                self.controlQ.async { self.inFlight = 0 }
+
+                conn.stateUpdateHandler = { [weak self] st in
+                    guard let self = self else { return }
                     DispatchQueue.main.async { self.status = "TCP client: \(st)" }
+
+                    // HOT-RESTART : à l’état ready, on pousse immédiatement SPS/PPS
+                    if case .ready = st {
+                        self.controlQ.async {
+                            switch self.outputProtocol {
+                            case .annexb:
+                                if let hdr = self.lastSpsPpsAnnexB {
+                                    conn.send(content: hdr, completion: .contentProcessed { _ in })
+                                    self.sentCodecHeader = true
+                                }
+                            case .avcc:
+                                if let hdr = self.lastAvccConfig {
+                                    conn.send(content: hdr, completion: .contentProcessed { _ in })
+                                    self.sentCodecHeader = true
+                                }
+                            }
+                            self.forceIDRNext = true
+                        }
+                    }
                 }
                 conn.start(queue: .global(qos: .userInitiated))
             }
@@ -344,7 +387,10 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         }
         session.addOutput(videoOutput)
 
-        if let c = videoOutput.connection(with: .video) { c.videoOrientation = orientation }
+        if let c = videoOutput.connection(with: .video) {
+            c.videoOrientation = orientation
+            if c.isVideoStabilizationSupported { c.preferredVideoStabilizationMode = .off }
+        }
 
         session.commitConfiguration()
         session.startRunning()
@@ -421,6 +467,8 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         // Temps réel + pas de B
         VTSessionSetProperty(vt, key: kVTCompressionPropertyKey_RealTime,             value: kCFBooleanTrue)
         VTSessionSetProperty(vt, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
+        VTSessionSetProperty(vt, key: kVTCompressionPropertyKey_AllowTemporalCompression,
+                             value: intraOnly ? kCFBooleanFalse : kCFBooleanTrue)
 
         let gop: Int32 = intraOnly ? 1 : 60
         VTSessionSetProperty(vt, key: kVTCompressionPropertyKey_MaxKeyFrameInterval,  value: NSNumber(value: gop))
@@ -428,6 +476,13 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         VTSessionSetProperty(vt, key: kVTCompressionPropertyKey_AverageBitRate,       value: NSNumber(value: bitrate))
         let limits: [NSNumber] = [NSNumber(value: bitrate/8), NSNumber(value: 1)]
         VTSessionSetProperty(vt, key: kVTCompressionPropertyKey_DataRateLimits,       value: limits as CFArray)
+
+        if #available(iOS 13.0, *) {
+            VTSessionSetProperty(vt, key: kVTCompressionPropertyKey_MaxFrameDelayCount,
+                                 value: NSNumber(value: 1))
+            VTSessionSetProperty(vt, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality,
+                                 value: kCFBooleanTrue)
+        }
 
         VTCompressionSessionPrepareToEncodeFrames(vt)
         statusUpdate("Encoder prêt (\(profile.label) \(useCabac ? "CABAC" : "CAVLC"), \(bitrate/1_000_000) Mb/s, GOP \(gop))")
@@ -440,7 +495,7 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
                        didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
 
-        // Back-pressure léger : si 2 frames déjà en vol, on ne lance pas l'encode pour cette frame
+        // Gating “early” : on évite d’encoder si déjà plein
         let saturated = controlQ.sync { inFlight >= maxInFlight }
         if saturated { registerDrop(); return }
 
@@ -487,6 +542,8 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
             switch outputProtocol {
             case .annexb:
                 if let spspps = H264Packer.annexBParameterSets(from: fmt) {
+                    // cache pour hot-restart
+                    lastSpsPpsAnnexB = spspps
                     if isKey { payload.append(spspps) }
                     else if !sentCodecHeader { payload.append(spspps); sentCodecHeader = true }
                 }
@@ -495,6 +552,7 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
                 }
             case .avcc:
                 if let spspps = H264Packer.avccParameterSets(from: fmt) {
+                    lastAvccConfig = spspps
                     if isKey { payload.append(spspps) }
                     else if !sentCodecHeader { payload.append(spspps); sentCodecHeader = true }
                 }
@@ -506,7 +564,7 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
 
         guard !payload.isEmpty else { return }
 
-        // Réserve un slot in-flight (2 max). Si saturé → drop.
+        // Réservation slot in-flight (définitif) ; si saturé → drop
         let reserved = controlQ.sync { () -> Bool in
             if inFlight >= maxInFlight { return false }
             inFlight += 1
@@ -566,6 +624,7 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
     }
 
     private func adaptTick() {
+        guard adaptationEnabled else { return }
         let drops = dropCountWindow
         dropCountWindow = 0
 
@@ -596,9 +655,7 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
                         dev.activeVideoMaxFrameDuration = ts
                         dev.unlockForConfiguration()
                     } catch {}
-                    DispatchQueue.main.async {
-                        self.status = "Adapt: fps ↓ \(Int(newFPS))"
-                    }
+                    DispatchQueue.main.async { self.status = "Adapt: fps ↓ \(Int(newFPS))" }
                 }
             }
         } else if drops == 0 {
@@ -611,9 +668,7 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
                 let limits: [NSNumber] = [NSNumber(value: bitrate/8), NSNumber(value: 1)]
                 VTSessionSetProperty(vt, key: kVTCompressionPropertyKey_DataRateLimits,
                                      value: limits as CFArray)
-                DispatchQueue.main.async {
-                    self.status = "Adapt: bitrate ↑ \(self.bitrate/1_000_000) Mb/s"
-                }
+                DispatchQueue.main.async { self.status = "Adapt: bitrate ↑ \(self.bitrate/1_000_000) Mb/s" }
             }
         }
     }
@@ -653,23 +708,15 @@ final class Streamer: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
     }
 
     private func orientationFromGravity(gx: Double, gy: Double) -> AVCaptureVideoOrientation {
-        if abs(gx) > abs(gy) {
-            // landscape: gx < 0 => tête à droite -> .landscapeRight
-            return gx < 0 ? .landscapeRight : .landscapeLeft
-        } else {
-            // on force portrait (évite upsideDown par défaut)
-            return .portrait
-        }
+        if abs(gx) > abs(gy) { return gx < 0 ? .landscapeRight : .landscapeLeft }
+        return .portrait // évite upsideDown
     }
 
     private func applyDeviceOrientation() {
         guard autoRotate, let conn = videoOutput.connection(with: .video) else { return }
-        // Si CoreMotion actif, cette fonction sert de fallback -> rien à faire.
-        // On s'assure simplement qu'au démarrage on pousse la valeur initiale.
         if let last = lastMotionOrientation {
             if conn.videoOrientation != last { conn.videoOrientation = last }
         } else {
-            // Fallback via UIDevice (si motion indispo)
             let devOri = UIDevice.current.orientation
             let newOri: AVCaptureVideoOrientation
             switch devOri {
