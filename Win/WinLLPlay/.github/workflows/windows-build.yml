@@ -1,0 +1,49 @@
+# .github/workflows/windows-build.yml
+name: Windows NVDEC Low-Latency Player
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  build-win:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: Win/WinLLPlay   # ← relatif à la racine du repo WinCamStreamIOS
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure (CMake, MSVC, x64)
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Prepare artifact (exe + DLLs)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item -Force build/Release/WinLLPlay.exe dist/
+
+          # SDL2.dll (d'après ton layout)
+          if (Test-Path "SDL2/lib/x64/SDL2.dll") {
+            Copy-Item -Force SDL2/lib/x64/SDL2.dll dist/
+          } elseif (Test-Path "SDL2/bin/SDL2.dll") {
+            Copy-Item -Force SDL2/bin/SDL2.dll dist/
+          } else {
+            Write-Host "SDL2.dll introuvable (mets-la dans SDL2/lib/x64 ou SDL2/bin)"
+          }
+
+          # DLL FFmpeg (si tu as un 'bin' avec les .dll)
+          if (Test-Path "FFMPEG/bin") {
+            Copy-Item -Force FFMPEG/bin/*.dll dist/ -ErrorAction SilentlyContinue
+          } else {
+            Write-Host "FFMPEG/bin absent : pense à fournir les DLL FFmpeg à l'exécution"
+          }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WinLLPlay-windows
+          path: Win/WinLLPlay/dist/**
