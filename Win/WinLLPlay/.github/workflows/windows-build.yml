@@ -9,10 +9,20 @@ jobs:
     runs-on: windows-latest
     defaults:
       run:
-        working-directory: Win/WinLLPlay   # ← relatif à la racine du repo WinCamStreamIOS
+        working-directory: Win/WinLLPlay
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          lfs: true   # utile si le zip est suivi avec Git LFS
+
+      - name: Unpack avcodec-62.zip (FFmpeg DLL)
+        shell: pwsh
+        run: |
+          $zip = "FFMPEG/bin/avcodec-62.zip"
+          if (!(Test-Path $zip)) { throw "Zip introuvable: $zip" }
+          Expand-Archive -Path $zip -DestinationPath "FFMPEG/bin" -Force
+          Get-ChildItem "FFMPEG/bin" | Format-Table Name,Length
 
       - name: Configure (CMake, MSVC, x64)
         run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
@@ -26,20 +36,20 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item -Force build/Release/WinLLPlay.exe dist/
 
-          # SDL2.dll (d'après ton layout)
+          # SDL2.dll (selon ton layout)
           if (Test-Path "SDL2/lib/x64/SDL2.dll") {
-            Copy-Item -Force SDL2/lib/x64/SDL2.dll dist/
+            Copy-Item -Force "SDL2/lib/x64/SDL2.dll" dist/
           } elseif (Test-Path "SDL2/bin/SDL2.dll") {
-            Copy-Item -Force SDL2/bin/SDL2.dll dist/
+            Copy-Item -Force "SDL2/bin/SDL2.dll" dist/
           } else {
-            Write-Host "SDL2.dll introuvable (mets-la dans SDL2/lib/x64 ou SDL2/bin)"
+            Write-Host "SDL2.dll introuvable (mets-la dans SDL2/lib/x64 ou SDL2/bin)."
           }
 
-          # DLL FFmpeg (si tu as un 'bin' avec les .dll)
+          # Toutes les DLL FFmpeg (dont avcodec-62.dll fraîchement extraite)
           if (Test-Path "FFMPEG/bin") {
-            Copy-Item -Force FFMPEG/bin/*.dll dist/ -ErrorAction SilentlyContinue
+            Copy-Item -Force "FFMPEG/bin/*.dll" dist/ -ErrorAction SilentlyContinue
           } else {
-            Write-Host "FFMPEG/bin absent : pense à fournir les DLL FFmpeg à l'exécution"
+            Write-Host "FFMPEG/bin absent — ajoute tes DLL au runtime."
           }
 
       - name: Upload artifact
