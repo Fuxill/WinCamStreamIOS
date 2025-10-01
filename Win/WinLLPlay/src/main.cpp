@@ -25,17 +25,17 @@ static inline int64_t now_us() {
 struct Args {
     std::string url = "tcp://127.0.0.1:5000?tcp_nodelay=1";
     bool prefer_gpu = true;
-    int  target_fps = 0;          // 0 = libre
-    bool drop_when_ahead = true;  // drop si en avance (latence mini)
+    int  target_fps = 0;          // 0 = free-run
+    bool drop_when_ahead = true;  // drop if ahead (lower latency)
 };
 
 static void usage(const char* exe) {
     std::cout
         << "Usage: " << exe << " [--url <tcp_url>] [--cpu] [--fps N] [--no-drop]\n"
         << "  --url tcp://127.0.0.1:5000?tcp_nodelay=1\n"
-        << "  --cpu           force decode CPU\n"
-        << "  --fps N         cadence cible d'affichage (0 = libre)\n"
-        << "  --no-drop       ne pas drop si on est en avance\n";
+        << "  --cpu           force CPU decode\n"
+        << "  --fps N         target display FPS (0 = free-run)\n"
+        << "  --no-drop       do not drop when ahead\n";
 }
 
 static std::optional<Args> parse_args(int argc, char** argv) {
@@ -54,7 +54,6 @@ static std::optional<Args> parse_args(int argc, char** argv) {
 
 // -------------------- NVDEC helpers --------------------
 static AVPixelFormat g_hw_pix_fmt = AV_PIX_FMT_NONE;
-
 static enum AVPixelFormat get_hw_format(AVCodecContext *ctx, const enum AVPixelFormat *pix_fmts) {
     for (const enum AVPixelFormat *p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
         if (*p == g_hw_pix_fmt) return *p;
@@ -84,7 +83,6 @@ int main(int argc, char** argv) {
     AVDictionary* fmt_opts = nullptr;
     av_dict_set(&fmt_opts, "probesize", "131072", 0);
     av_dict_set(&fmt_opts, "analyzeduration", "0", 0);
-    // NB: pour TCP, tcp_nodelay=1 dans l'URL est déjà clé.
 
     if (avformat_open_input(&fmt, args.url.c_str(), nullptr, &fmt_opts) < 0) {
         std::cerr << "avformat_open_input failed: " << args.url << "\n";
@@ -125,15 +123,15 @@ int main(int argc, char** argv) {
     dec->flags  |= AV_CODEC_FLAG_LOW_DELAY;
     dec->flags2 |= AV_CODEC_FLAG2_FAST;
 
-    // petits réglages utiles quand dispos (ne casse pas si non supporté)
-    av_opt_set_int(dec, "tune", AVVIDEOENCODER_TUNE_ZERO_LATENCY, 0); // no-op côté decoder mais sans danger
-    av_opt_set_int(dec->priv_data, "delay", 0, 0);                    // certains décoders honorent "delay=0"
+    // Some decoders accept these private options (safe if ignored)
     if (cuvid) {
         av_opt_set_int(dec->priv_data, "surfaces", 4, 0);
         av_opt_set_int(dec->priv_data, "extra_hw_frames", 0, 0);
     }
+    // For generic h264 decoder, many builds ignore "delay"; it's fine if unused.
+    av_opt_set_int(dec->priv_data, "delay", 0, 0);
 
-    // HW device CUDA si souhaité
+    // HW device CUDA if desired
     AVBufferRef* hw_dev = nullptr;
     if (want_cuda) {
         if (av_hwdevice_ctx_create(&hw_dev, AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 0) == 0) {
@@ -147,7 +145,7 @@ int main(int argc, char** argv) {
         }
     }
     if (!want_cuda) {
-        dec->thread_count = 1; // latence mini (mets 2..4 si tu préfères plus de perf CPU)
+        dec->thread_count = 1; // minimal latency on CPU
     }
 
     if (avcodec_open2(dec, codec, nullptr) < 0) {
@@ -173,9 +171,9 @@ int main(int argc, char** argv) {
 
     SDL_Renderer* ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
     if (!ren) { std::cerr << "SDL_CreateRenderer failed\n"; return 1; }
-    SDL_RenderSetVSync(ren, 0); // VSYNC OFF pour éviter ~16 ms de latence
+    SDL_RenderSetVSync(ren, 0); // VSYNC OFF (avoid ~16ms pacing)
 
-    // Deux textures possibles : NV12 (GPU) ou IYUV (CPU / fallback)
+    // Two textures possible: NV12 (GPU path) or I420 (CPU/fallback)
     SDL_Texture* texNV12 = nullptr;
     SDL_Texture* texI420 = nullptr;
 
@@ -190,14 +188,13 @@ int main(int argc, char** argv) {
         return texI420 != nullptr;
     };
 
-    // swscale pour CPU & pour GPU si pas NV12
     SwsContext* sws = nullptr;
 
     // ---- buffers ----
     AVPacket* pkt     = av_packet_alloc();
-    AVFrame* frame    = av_frame_alloc(); // peut être AV_PIX_FMT_CUDA
-    AVFrame* sw_frame = av_frame_alloc(); // CPU copy si GPU
-    AVFrame* yuv420p  = av_frame_alloc(); // frame cible I420
+    AVFrame* frame    = av_frame_alloc(); // may be AV_PIX_FMT_CUDA
+    AVFrame* sw_frame = av_frame_alloc(); // CPU copy for GPU path
+    AVFrame* yuv420p  = av_frame_alloc(); // I420 for SDL fallback
 
     auto alloc_yuv420p = [&](int w, int h) {
         av_frame_unref(yuv420p);
@@ -221,7 +218,6 @@ int main(int argc, char** argv) {
 
     // -------------------- loop --------------------
     while (running) {
-        // events
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) running = false;
@@ -242,7 +238,6 @@ int main(int argc, char** argv) {
             int w = frame->width, h = frame->height;
             if ((w != W || h != H) && w > 0 && h > 0) {
                 W = w; H = h;
-                // re-alloue textures
                 if (texNV12) { alloc_tex_nv12(W,H); }
                 if (texI420) { alloc_tex_i420(W,H); }
                 if (yuv420p) { alloc_yuv420p(W,H); }
@@ -252,7 +247,7 @@ int main(int argc, char** argv) {
             AVFrame* src = frame;
             AVPixelFormat src_fmt = static_cast<AVPixelFormat>(frame->format);
 
-            // si GPU → ramène en CPU
+            // GPU path → bring to CPU (likely NV12)
             if (want_cuda && frame->format == AV_PIX_FMT_CUDA) {
                 av_frame_unref(sw_frame);
                 if (av_hwframe_transfer_data(sw_frame, frame, 0) < 0) {
@@ -260,19 +255,17 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 src = sw_frame;
-                src_fmt = static_cast<AVPixelFormat>(sw_frame->format); // NV12 en général
+                src_fmt = static_cast<AVPixelFormat>(sw_frame->format);
             }
 
             bool rendered = false;
 
-            // fast-path NV12 → texture NV12 (zéro conversion)
+            // fast-path: NV12 → NV12 texture (no swscale)
             if (src_fmt == AV_PIX_FMT_NV12) {
                 if (!texNV12 && !alloc_tex_nv12(W,H)) { std::cerr << "NV12 texture alloc failed\n"; break; }
-                // planes: Y puis UV interleavé
                 if (SDL_UpdateNVTexture(texNV12, nullptr,
                                         src->data[0], src->linesize[0],
                                         src->data[1], src->linesize[1]) == 0) {
-                    // cadence / drop
                     bool do_present = true;
                     if (args.target_fps > 0) {
                         double elapsed = (double)(now_us() - last_present_us);
@@ -294,7 +287,7 @@ int main(int argc, char** argv) {
                 }
             }
 
-            // fallback: conversion → I420
+            // fallback: convert to I420 → IYUV texture
             if (!rendered) {
                 if (!texI420 && !alloc_tex_i420(W,H)) { std::cerr << "I420 texture alloc failed\n"; break; }
                 if (!sws) {
